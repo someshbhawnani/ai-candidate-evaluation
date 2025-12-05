@@ -7,21 +7,64 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableSequence
+# from langchain_core.runnables import RunnableSequence  # removed - unused
 import json
 import re
 import hashlib
 from datetime import datetime
-from pathlib import Path
+# from pathlib import Path  # removed - unused
+import logging
+import csv
+import io
 import base64
 import httpx
-# audio recorder integration removed - recording section cleaned up
+try:
+    from audio_recorder_streamlit import audio_recorder
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
 
 # -------------------------
 # Configuration
 # -------------------------
 # Load environment variables
 load_dotenv()
+
+# Ensure a usable SSL_CERT_FILE is set early so httpx/openai won't try to
+# read an administrator-only CA file. If the configured path is not readable
+# we replace it with certifi's bundle when available.
+try:
+    import certifi as _certifi
+
+    def _readable(path):
+        try:
+            if not path:
+                return False
+            with open(path, "rb"):
+                return True
+        except Exception:
+            return False
+
+    _cand = os.environ.get("SSL_CERT_FILE")
+    if not _readable(_cand):
+        # If we have generated a combined CA bundle in the project (e.g. certs/combined_ca.pem),
+        # prefer that since it may include the private CA that signs the LLM host certificate.
+        try:
+            from pathlib import Path
+            project_root = Path(__file__).resolve().parent
+            combined_path = project_root / "certs" / "combined_ca.pem"
+            if combined_path.exists() and _readable(str(combined_path)):
+                os.environ["SSL_CERT_FILE"] = str(combined_path)
+                logging.info(f"SSL_CERT_FILE set to project combined CA bundle: {combined_path}")
+            else:
+                os.environ["SSL_CERT_FILE"] = _certifi.where()
+                logging.info("SSL_CERT_FILE set to certifi bundle to avoid unreadable system CA file")
+        except Exception:
+            os.environ["SSL_CERT_FILE"] = _certifi.where()
+            logging.info("SSL_CERT_FILE set to certifi bundle to avoid unreadable system CA file")
+except Exception:
+    # If certifi isn't installed or anything goes wrong, leave environment as-is.
+    pass
 
 # Ensure Python/requests/ssl use a readable CA bundle inside the venv
 # This prevents PermissionError when a system `SSL_CERT_FILE` points to
@@ -34,71 +77,128 @@ except Exception:
     # behavior (using system env vars) will still apply.
     pass
 
+st.session_state.audio_answer = None
+if "admin_logged_in" not in st.session_state:
+    st.session_state.admin_logged_in = False
+if "admin_username" not in st.session_state:
+    st.session_state.admin_username = None
+
 # Ensure DEEPSEEK_API_KEY is set in your environment
 if "DEEPSEEK_API_KEY" not in os.environ:
-    st.warning("Set environment variable DEEPSEEK_API_KEY before running. Example: export DEEPSEEK_API_KEY='sk-...'")
+    st.warning("Set environment variable DEEPSEEK_API_KEY before running. Example (PowerShell): $env:DEEPSEEK_API_KEY='sk-...'")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
-# Difficulty / complexity tuning
-CORRECT_SCORE_THRESHOLD = 16  # score >= this is considered a correct/good answer
-MAX_COMPLEXITY = 5
-MIN_COMPLEXITY = 1
+# Also expose a shorter alias for other internal uses
+API_KEY = DEEPSEEK_API_KEY
 
-# Initialize LLM via LangChain with DeepSeek
-client = httpx.Client(verify=False)
+# --- Admin credentials (use env vars with safe fallback) ---
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@123")  # change in env for production
+
+
+# Create an httpx client for LLM calls. Support a safe certifi fallback
+# when `SSL_CERT_FILE` points to an unreadable system file, and also
+# support an opt-in insecure mode controlled by `ALLOW_INSECURE_LLM` for
+# development/testing only.
+def _is_readable(path):
+    try:
+        if not path:
+            return False
+        with open(path, "rb"):
+            return True
+    except Exception:
+        return False
+
+# If explicitly allowed, disable TLS verification for the LLM client.
+ALLOW_INSECURE = os.environ.get("ALLOW_INSECURE_LLM", "").lower() in ("1", "true", "yes", "on")
+if ALLOW_INSECURE:
+    logging.warning("ALLOW_INSECURE_LLM enabled: TLS verification DISABLED for LLM http client (INSECURE)")
+    client = httpx.Client(verify=False)
+else:
+    # Prefer the env var if it's readable, otherwise override with certifi.
+    _env_cert = os.environ.get("SSL_CERT_FILE")
+    if not _is_readable(_env_cert):
+        try:
+            os.environ["SSL_CERT_FILE"] = certifi.where()
+            logging.info("SSL_CERT_FILE overridden to certifi bundle to avoid unreadable system CA file")
+        except Exception:
+            # If certifi isn't available or something goes wrong, leave env as-is
+            pass
+
+    _verify_path = os.environ.get("SSL_CERT_FILE")
+    try:
+        if _verify_path:
+            client = httpx.Client(verify=_verify_path)
+        else:
+            client = httpx.Client(verify=True)
+    except PermissionError:
+        logging.warning("PermissionError reading SSL_CERT_FILE; removing env var and falling back to system verification")
+        try:
+            os.environ.pop("SSL_CERT_FILE", None)
+        except Exception:
+            pass
+        client = httpx.Client(verify=True)
+
+# Initialize the ChatOpenAI wrapper using our httpx client
 llm = ChatOpenAI(
-base_url="https://genailab.tcs.in",
-model = "azure_ai/genailab-maas-DeepSeek-V3-0324",
-api_key="sk-DoW1qrOmGHAothEoYV2oSA",
-http_client = client
+    base_url="https://genailab.tcs.in",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key=API_KEY,
+    http_client=client,
 )
 
-# -------------------------
-# Helper functions
-# -------------------------
-def init_state():
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-    if "candidate" not in st.session_state:
-        st.session_state.candidate = {}
-    if "role" not in st.session_state:
-        st.session_state.role = None
-    if "lang" not in st.session_state:
-        st.session_state.lang = "English"
-    if "skills" not in st.session_state:
-        st.session_state.skills = []
-    if "asked_questions" not in st.session_state:
-        st.session_state.asked_questions = []
-    if "qa_history" not in st.session_state:
-        st.session_state.qa_history = []  # list of dicts: {q, a, score, feedback}
-    if "question_count" not in st.session_state:
-        st.session_state.question_count = 0
-    if "finalized" not in st.session_state:
-        st.session_state.finalized = False
-    if "current_question" not in st.session_state:
-        st.session_state.current_question = ""
-    if "welcome_shown" not in st.session_state:
-        st.session_state.welcome_shown = False
-    if "last_ai_message" not in st.session_state:
-        st.session_state.last_ai_message = ""
-    if "current_is_coding" not in st.session_state:
-        st.session_state.current_is_coding = False
-    if "question_start_time" not in st.session_state:
-        st.session_state.question_start_time = None
-    if "total_start_time" not in st.session_state:
-        st.session_state.total_start_time = None
-    if "time_expired" not in st.session_state:
-        st.session_state.time_expired = False
-    if "username" not in st.session_state:
-        st.session_state.username = None
-    if "page_redirect" not in st.session_state:
-        st.session_state.page_redirect = None
-    if "voice_mode" not in st.session_state:
-        st.session_state.voice_mode = False
-    if "audio_answer" not in st.session_state:
-        st.session_state.audio_answer = None
-    if "complexity_level" not in st.session_state:
-        st.session_state.complexity_level = 1
+# Role -> suggested skills mapping used to populate the skills multiselect
+ROLE_SKILLS = {
+    "Java Developer": [
+        "Core Java",
+        "Spring / Spring Boot",
+        "Concurrency / Multithreading",
+        "Maven / Gradle",
+        "REST / Web APIs",
+        "JPA / SQL",
+        "Testing (JUnit)",
+    ],
+    "Database Administrator": [
+        "PostgreSQL / MySQL",
+        "Backup & Recovery",
+        "Replication / HA",
+        "Performance Tuning",
+        "Security",
+        "Monitoring",
+    ],
+    "Frontend Developer": [
+        "HTML / CSS / JS",
+        "React / Angular / Vue",
+        "State Management",
+        "Accessibility",
+        "Responsive Design",
+        "Testing (Jest)",
+    ],
+    "DevOps Engineer": [
+        "Docker",
+        "Kubernetes",
+        "CI/CD",
+        "Terraform / IaC",
+        "Monitoring / Logging",
+        "Linux / Scripting",
+    ],
+    "Data Engineer": [
+        "Python / Scala",
+        "ETL / Data Pipelines",
+        "Spark",
+        "Airflow",
+        "Data Modeling",
+        "SQL",
+    ],
+    "Python Developer": [
+        "Core Python",
+        "Flask / Django",
+        "Async IO",
+        "Testing (pytest)",
+        "APIs",
+        "Data Structures",
+    ],
+}
 
 def get_time_remaining(start_time, max_seconds):
     """Calculate remaining time in seconds"""
@@ -108,363 +208,202 @@ def get_time_remaining(start_time, max_seconds):
     remaining = max_seconds - elapsed
     return max(0, remaining)
 
-
 def format_time(seconds):
     """Format seconds as MM:SS"""
     mins = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{mins:02d}:{secs:02d}"
 
-
-def text_to_speech(text: str) -> str:
-    """Return a small JS snippet to speak text using SpeechSynthesis."""
-    import json as _json
-    safe_text = _json.dumps(text)
-    js = f"""
-    <script>
-    (function() {{
-        try {{
-            var msg = new SpeechSynthesisUtterance();
-            msg.text = {safe_text};
-            msg.lang = 'en-US';
-            msg.rate = 0.9;
-            msg.pitch = 1;
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(msg);
-        }} catch(e) {{ console.warn('TTS error', e); }}
-    }})();
-    </script>
-    """
-    return js
-
-
-def create_audio_player(text: str, key: str) -> str:
-    """Return minimal HTML/JS for a TTS button that works across browsers."""
-    import json as _json
-    safe_text = _json.dumps(text)
-    html = f"""
-    <div id="tts_container_{key}">
-      <button id="btn_{key}" style="background:#667eea;color:#fff;border:none;padding:8px 14px;border-radius:8px;">🔊 Listen</button>
-    </div>
-    <script>
-    (function() {{
-        try {{
-            var btn = document.getElementById('btn_{key}');
-            function speak() {{
-                try {{
-                    var u = new SpeechSynthesisUtterance({safe_text});
-                    u.lang = 'en-US'; u.rate = 0.9; u.pitch = 1.0;
-                    window.speechSynthesis.cancel();
-                    window.speechSynthesis.speak(u);
-                }} catch(e) {{ console.warn('speak failed', e); }}
-            }}
-            if (btn) {{ btn.addEventListener('click', function(e){{ e.preventDefault(); speak(); }}); }}
-        }} catch(e) {{ console.warn('create_audio_player error', e); }}
-    }})();
-    </script>
-    """
-    return html
-
-def create_timer_html(start_time: float, max_seconds: int, key: str) -> str:
-        """Return HTML+JS for a client-side countdown timer that updates every second.
-
-        start_time: epoch seconds (float). If 0 or None, timer will show full time and count down from now.
-        """
-        # Ensure numeric values are passed into the JS
-        st = float(start_time) if start_time else 0.0
-        ms = int(max_seconds)
-        safe_key = str(key)
-        html = f"""
-        <div id="timer_container_{safe_key}" style="text-align:center;padding:6px 8px;">
-            <div id="timer_label_{safe_key}" style="font-size:12px;color:#666;margin-bottom:6px;">Question Timer</div>
-            <div id="timer_value_{safe_key}" style="font-family:monospace; font-size:20px; font-weight:700;">--:--</div>
-        </div>
-        <script>
-        (function() {{
-            var start = {st};
-            var maxSecs = {ms};
-            var label = document.getElementById('timer_label_{safe_key}');
-            var valueEl = document.getElementById('timer_value_{safe_key}');
-
-            function fmt(s) {{
-                var m = Math.floor(s/60); var sec = Math.floor(s%60);
-                return (m<10?('0'+m):m) + ':' + (sec<10?('0'+sec):sec);
-            }}
-
-            var autoSubmitted = false;
-            function tryAutoSubmit() {{
-                try {{
-                    // Use parent document when available (component runs inside an iframe)
-                    var hostDoc = (window.parent && window.parent.document) ? window.parent.document : document;
-                    // Find likely answer textarea(s) - prefer visible ones
-                    var candidates = Array.from(hostDoc.querySelectorAll('textarea'));
-                    var target = null;
-                    for (var i=0;i<candidates.length;i++){{
-                        var el = candidates[i];
-                        try {{ if (el.offsetParent === null) continue; }} catch(e) {{ /* some nodes may not expose offsetParent cross-doc */ }}
-                        var ph = (el.getAttribute('placeholder') || '').toLowerCase();
-                        if (ph.includes('type your answer') || ph.includes('write your code') || (el.id && el.id.includes('answer'))) {{ target = el; break; }}
-                    }}
-                    if (!target && candidates.length>0) target = candidates[candidates.length-1];
-
-                    var val = target ? (target.value || '').trim() : '';
-                    // Find buttons - Streamlit renders form buttons as <button> elements; prefer visible ones
-                    var buttons = Array.from(hostDoc.querySelectorAll('button'));
-                    var submitBtn = null, skipBtn = null;
-                    buttons.forEach(function(b){{
-                        try {{
-                            if (b.offsetParent === null) return; // hidden
-                            var txt = (b.innerText || b.value || '').toLowerCase();
-                            if (!submitBtn && (txt.includes('submit answer') || txt.includes('submit'))) submitBtn = b;
-                            if (!skipBtn && (txt.includes('skip') || txt.includes("don't know") || txt.includes('dont know') || txt.includes("skip / don't know"))) skipBtn = b;
-                        }} catch(e){{}}
-                    }});
-
-                    if (val && submitBtn) {{
-                        console.log('[autosubmit] Answer present - auto-clicking Submit');
-                        // Ensure Streamlit sees the latest value on the host document
-                        try {{ target.dispatchEvent(new Event('input', {{ bubbles: true }})); }} catch(e) {{ console.warn('dispatch input failed', e); }}
-                        try {{ submitBtn.click(); }} catch(e) {{ console.warn('submit click failed', e); }}
-                        autoSubmitted = true;
-                    }} else if (!val && skipBtn) {{
-                        console.log('[autosubmit] No answer - auto-clicking Skip');
-                        try {{ skipBtn.click(); }} catch(e) {{ console.warn('skip click failed', e); }}
-                        autoSubmitted = true;
-                    }} else {{
-                        console.log('[autosubmit] Could not find target textarea or buttons to auto-submit.');
-                    }}
-                }} catch(e) {{ console.warn('auto-submit failed', e); }}
-            }}
-
-            function update() {{
-                var now = Date.now()/1000;
-                var elapsed = start && start>0 ? now - start : 0;
-                var remaining = Math.max(0, Math.round(maxSecs - elapsed));
-                var color = remaining>300 ? '#16a34a' : (remaining>60 ? '#d97706' : '#dc2626');
-                var emoji = remaining>300 ? '🟢' : (remaining>60 ? '🟡' : '🔴');
-                try {{
-                    valueEl.textContent = fmt(remaining);
-                    valueEl.style.color = color;
-                    label.textContent = emoji + ' Question Timer';
-                    // When timer reaches zero, attempt auto-submit once
-                    if (remaining <= 0 && !autoSubmitted) {{
-                        // Give a short delay to allow any pending user input events to settle
-                        setTimeout(tryAutoSubmit, 250);
-                    }}
-                }} catch(e) {{ console.warn('timer update failed', e); }}
-            }}
-
-            update();
-            setInterval(update, 1000);
-        }})();
-        </script>
-        """
-        return html
-
-def create_total_timer_html(start_time: float, max_seconds: int, key: str) -> str:
-    """Client-side total countdown timer that attempts to click a hidden auto-end button when expired."""
-    st_val = float(start_time) if start_time else 0.0
-    ms = int(max_seconds)
-    safe_key = str(key)
-    html = f"""
-    <div id="total_timer_container_{safe_key}" style="text-align:center;padding:6px 8px;">
-        <div id="total_timer_label_{safe_key}" style="font-size:12px;color:#666;margin-bottom:6px;">Total Interview Time</div>
-        <div id="total_timer_value_{safe_key}" style="font-family:monospace; font-size:18px; font-weight:700;">--:--</div>
-    </div>
-    <script>
-    (function() {{
-        var start = {st_val};
-        var maxSecs = {ms};
-        var label = document.getElementById('total_timer_label_{safe_key}');
-        var valueEl = document.getElementById('total_timer_value_{safe_key}');
-
-        function fmt(s) {{
-            var m = Math.floor(s/60); var sec = Math.floor(s%60);
-            return (m<10?('0'+m):m) + ':' + (sec<10?('0'+sec):sec);
-        }}
-
-        var done = false;
-        function tryAutoEnd() {{
-            try {{
-                var hostDoc = (window.parent && window.parent.document) ? window.parent.document : document;
-                // Try to find a dedicated auto-end button by text
-                var buttons = Array.from(hostDoc.querySelectorAll('button'));
-                var target = null;
-                buttons.forEach(function(b) {{
-                    try {{
-                        var txt = (b.innerText || b.value || '').toLowerCase();
-                        if (!target && (txt.includes('auto end') || txt.includes('end interview') || txt.includes('finish interview') || txt.includes('export complete evaluation report') )) {{
-                            target = b;
-                        }}
-                    }} catch(e){{}}
-                }});
-
-                if (target) {{
-                    console.log('[total-autotimer] clicking auto-end target');
-                    try {{ target.click(); }} catch(e) {{ console.warn('auto-end click failed', e); }}
-                    done = true;
-                }} else {{
-                    // If no dedicated button, try to trigger a general rerun by clicking any visible interactive button (best-effort)
-                    for (var i=0;i<buttons.length;i++) {{
-                        try {{ if (buttons[i].offsetParent !== null) {{ buttons[i].click(); done = true; break; }} }} catch(e){{}}
-                    }}
-                    if (!done) console.log('[total-autotimer] no button found to click for auto-end');
-                }}
-            }} catch(e) {{ console.warn('tryAutoEnd failed', e); }}
-        }}
-
-        function update() {{
-            var now = Date.now()/1000;
-            var elapsed = start && start>0 ? now - start : 0;
-            var remaining = Math.max(0, Math.round(maxSecs - elapsed));
-            try {{
-                valueEl.textContent = fmt(remaining);
-                var color = remaining>600 ? '#16a34a' : (remaining>120 ? '#d97706' : '#dc2626');
-                valueEl.style.color = color;
-                if (remaining <= 0 && !done) {{
-                    // Slight delay so any final events settle
-                    setTimeout(tryAutoEnd, 250);
-                }}
-            }} catch(e) {{ console.warn('total timer update failed', e); }}
-        }}
-
-        update();
-        setInterval(update, 1000);
-    }})();
-    </script>
-    """
-    return html
-
-def create_code_ide_html(initial_code: str, key: str, language: str = 'python') -> str:
-        """Return HTML for an embedded Ace editor with Save->Parent textarea functionality."""
-        import json as _json
-        safe_code = _json.dumps(initial_code)
-        safe_key = str(key)
-
-        # Template uses placeholders which we'll replace safely
-        template = '''
-        <div style="font-family:monospace;color:#fff">
-            <div id="editor_%%SAFE_KEY%%" style="height:320px;width:100%;border-radius:8px;overflow:hidden;margin-bottom:8px;"></div>
-            <div style="display:flex;gap:8px;">
-                <button id="save_%%SAFE_KEY%%" style="background:linear-gradient(90deg,#10b981,#06b6d4);border:none;padding:8px 12px;border-radius:8px;color:#fff;font-weight:600;">Save to Answer</button>
-                <button id="clear_%%SAFE_KEY%%" style="background:#374151;border:none;padding:8px 12px;border-radius:8px;color:#fff;font-weight:600;">Clear</button>
-                <div id="ide_status_%%SAFE_KEY%%" style="margin-left:8px;color:#ddd;align-self:center;font-size:13px"></div>
-            </div>
-        </div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.14/ace.js" crossorigin="anonymous"></script>
-        <script>
-        (function(){
-            try {
-                var editor = ace.edit('editor_' + %%SAFE_KEY_JSON%%);
-                editor.setTheme('ace/theme/monokai');
-                var lang = %%LANG_QUOTED%%;
-                var mode = 'ace/mode/python';
-                try {
-                    if (lang === 'javascript') mode = 'ace/mode/javascript';
-                    else if (lang === 'java') mode = 'ace/mode/java';
-                    else if (lang === 'c' || lang === 'cpp') mode = 'ace/mode/c_cpp';
-                    else if (lang === 'go') mode = 'ace/mode/golang';
-                    else if (lang === 'ruby') mode = 'ace/mode/ruby';
-                } catch(e) {}
-                editor.session.setMode(mode);
-                editor.session.setValue(%%SAFE_CODE%%);
-                editor.session.setTabSize(4);
-
-                function findAnswerTextarea() {
-                    var hostDoc = (window.parent && window.parent.document) ? window.parent.document : document;
-                    var candidates = Array.from(hostDoc.querySelectorAll('textarea'));
-                    var target = null;
-                    for (var i=0;i<candidates.length;i++){
-                        var el = candidates[i];
-                        try { if (el.offsetParent === null) continue; } catch(e){}
-                        var ph = (el.getAttribute('placeholder')||'').toLowerCase();
-                        if (ph.includes('write your code') || ph.includes('type your answer') || (el.id && el.id.includes('answer'))) { target = el; break; }
-                    }
-                    if (!target && candidates.length>0) target = candidates[candidates.length-1];
-                    return target;
-                }
-
-                document.getElementById('save_' + %%SAFE_KEY_JSON%%).addEventListener('click', function(e){
-                    e.preventDefault();
-                    try{
-                        var code = editor.getValue();
-                        var tgt = findAnswerTextarea();
-                        if (tgt) {
-                            try {
-                                // Use native setter to ensure React/Streamlit detects the change
-                                var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                                if (setter) {
-                                    setter.call(tgt, code);
-                                } else {
-                                    tgt.value = code;
-                                }
-                                // Dispatch input and change events so Streamlit picks up the new value
-                                tgt.dispatchEvent(new Event('input', { bubbles: true }));
-                                tgt.dispatchEvent(new Event('change', { bubbles: true }));
-                                document.getElementById('ide_status_' + %%SAFE_KEY_JSON%%).textContent = 'Saved to answer field';
-                            } catch(inner) {
-                                console.warn('native set failed', inner);
-                                try { tgt.value = code; tgt.dispatchEvent(new Event('input', { bubbles: true })); } catch(e2){}
-                                document.getElementById('ide_status_' + %%SAFE_KEY_JSON%%).textContent = 'Saved (best-effort)';
-                            }
-                        } else {
-                            document.getElementById('ide_status_' + %%SAFE_KEY_JSON%%).textContent = 'Could not find answer field on page';
-                        }
-                    } catch(err) { console.warn(err); document.getElementById('ide_status_' + %%SAFE_KEY_JSON%%).textContent = 'Save failed'; }
-                });
-
-                document.getElementById('clear_' + %%SAFE_KEY_JSON%%).addEventListener('click', function(e){
-                    e.preventDefault(); editor.session.setValue(''); document.getElementById('ide_status_' + %%SAFE_KEY_JSON%%).textContent = 'Cleared';
-                });
-            } catch(e) { console.warn('IDE init failed', e); }
-        })();
-        </script>
-        '''
-
-        # Safe JSON-encoded key for JS concatenation (includes quotes)
-        safe_key_json = _json.dumps(safe_key)
-        # Quoted language string for JS comparison
-        lang_quoted = _json.dumps(language)
-
-        html = template.replace('%%SAFE_KEY%%', safe_key)
-        html = html.replace('%%SAFE_KEY_JSON%%', safe_key_json)
-        html = html.replace('%%SAFE_CODE%%', safe_code)
-        html = html.replace('%%LANG_QUOTED%%', lang_quoted)
-
-        return html
-
-# Simple file-backed DB helpers
+# Database functions
 USERS_DB = "users.json"
 EVAL_HISTORY_DB = "evaluation_history.json"
 
 def load_users():
+    """Load users from JSON database"""
     if os.path.exists(USERS_DB):
-        try:
-            with open(USERS_DB, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with open(USERS_DB, 'r') as f:
+            return json.load(f)
     return {}
 
 def save_users(users):
+    """Save users to JSON database"""
     with open(USERS_DB, 'w') as f:
         json.dump(users, f, indent=2)
 
 def load_eval_history():
+    """Load evaluation history from JSON database"""
     if os.path.exists(EVAL_HISTORY_DB):
-        try:
-            with open(EVAL_HISTORY_DB, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with open(EVAL_HISTORY_DB, 'r') as f:
+            return json.load(f)
     return {}
 
 def save_eval_history(history):
+    """Save evaluation history to JSON database"""
     with open(EVAL_HISTORY_DB, 'w') as f:
         json.dump(history, f, indent=2)
 
-def hash_password(password: str) -> str:
+
+def eval_history_to_csv_for_user(username: str) -> str:
+    """Generate CSV string for a single user's evaluation history."""
+    history = load_eval_history()
+    evs = history.get(username, [])
+    out = io.StringIO()
+    writer = csv.writer(out)
+    # Header
+    writer.writerow(["username", "date", "role", "total_score", "max_score", "percentage", "time_taken", "question_index", "question", "answer", "score", "feedback"])
+    for ev in evs:
+        date = ev.get('date')
+        role = ev.get('role')
+        total = ev.get('score')
+        mx = ev.get('max_score')
+        pct = ev.get('percentage')
+        tt = ev.get('time_taken')
+        qa_list = ev.get('qa_history', [])
+        if not qa_list:
+            writer.writerow([username, date, role, total, mx, pct, tt, "", "", "", "", ""])
+        else:
+            for idx, qa in enumerate(qa_list, start=1):
+                writer.writerow([username, date, role, total, mx, pct, tt, idx, qa.get('q',''), qa.get('a',''), qa.get('score',''), qa.get('feedback','')])
+    return out.getvalue()
+
+
+def eval_history_to_csv_all() -> str:
+    """Generate CSV string for all users' evaluation history."""
+    history = load_eval_history()
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["username", "date", "role", "total_score", "max_score", "percentage", "time_taken", "question_index", "question", "answer", "score", "feedback"])
+    for username, evs in history.items():
+        for ev in evs:
+            date = ev.get('date')
+            role = ev.get('role')
+            total = ev.get('score')
+            mx = ev.get('max_score')
+            pct = ev.get('percentage')
+            tt = ev.get('time_taken')
+            qa_list = ev.get('qa_history', [])
+            if not qa_list:
+                writer.writerow([username, date, role, total, mx, pct, tt, "", "", "", "", ""])
+            else:
+                for idx, qa in enumerate(qa_list, start=1):
+                    writer.writerow([username, date, role, total, mx, pct, tt, idx, qa.get('q',''), qa.get('a',''), qa.get('score',''), qa.get('feedback','')])
+    return out.getvalue()
+
+def hash_password(password):
+    """Hash password using SHA256"""
     return hashlib.sha256(password.encode()).hexdigest()
+
+def text_to_speech(text):
+    """Convert text to speech using browser's Web Speech API"""
+    # Create JavaScript code to use browser's speech synthesis
+    speech_js = f"""
+    <script>
+    function speak() {{
+        var msg = new SpeechSynthesisUtterance();
+        msg.text = `{text}`;
+        msg.lang = 'en-US';
+        msg.rate = 0.9;
+        msg.pitch = 1;
+        window.speechSynthesis.speak(msg);
+    }}
+    speak();
+    </script>
+    """
+    return speech_js
+
+def create_audio_player(text, key):
+    """Create an audio player button that reads text aloud"""
+    # Escape special characters for JavaScript - use JSON encoding for safety
+    import json
+    safe_text = json.dumps(text)
+    
+    audio_html = f"""
+    <div id="tts_container_{key}">
+        <button onclick="speakText_{key}()" id="btn_{key}" style="
+            background-color: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px 0;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transition: all 0.3s;
+            font-weight: 600;
+        " onmouseover="this.style.backgroundColor='#5568d3'" onmouseout="this.style.backgroundColor='#667eea'">
+            🔊 Listen to Question
+        </button>
+    </div>
+    <script type="text/javascript">
+    (function() {{
+        // Ensure speech synthesis is loaded
+        if ('speechSynthesis' in window) {{
+            window.speakText_{key} = function() {{
+                // Cancel any ongoing speech
+                window.speechSynthesis.cancel();
+                
+                // Small delay to ensure cancel completes
+                setTimeout(function() {{
+                    // Create new utterance
+                    var msg = new SpeechSynthesisUtterance();
+                    msg.text = {safe_text};
+                    msg.lang = 'en-US';
+                    msg.rate = 0.85;
+                    msg.pitch = 1.0;
+                    msg.volume = 1.0;
+                    
+                    // Visual feedback
+                    var btn = document.getElementById('btn_{key}');
+                    if (btn) {{
+                        btn.innerHTML = '🔴 Speaking...';
+                        btn.style.backgroundColor = '#e74c3c';
+                    }}
+                    
+                    msg.onend = function() {{
+                        if (btn) {{
+                            btn.innerHTML = '🔊 Listen to Question';
+                            btn.style.backgroundColor = '#667eea';
+                        }}
+                    }};
+                    
+                    msg.onerror = function(event) {{
+                        console.error('Speech synthesis error:', event);
+                        if (btn) {{
+                            btn.innerHTML = '🔊 Listen to Question';
+                            btn.style.backgroundColor = '#667eea';
+                        }}
+                        alert('Speech error: ' + event.error + '. Please check your browser settings.');
+                    }};
+                    
+                    // Load voices if not loaded yet
+                    var voices = window.speechSynthesis.getVoices();
+                    if (voices.length > 0) {{
+                        // Try to find English voice
+                        var englishVoice = voices.find(v => v.lang.startsWith('en'));
+                        if (englishVoice) {{
+                            msg.voice = englishVoice;
+                        }}
+                    }}
+                    
+                    // Speak
+                    window.speechSynthesis.speak(msg);
+                    console.log('TTS started for:', msg.text.substring(0, 50) + '...');
+                }}, 100);
+            }};
+        }} else {{
+            console.error('Speech synthesis not supported in this browser');
+            var btn = document.getElementById('btn_{key}');
+            if (btn) {{
+                btn.innerHTML = '❌ TTS Not Supported';
+                btn.disabled = true;
+                btn.style.backgroundColor = '#999';
+            }}
+        }}
+    }})();
+    </script>
+    """
+    return audio_html
 
 def verify_password(stored_hash, password):
     """Verify password against stored hash"""
@@ -496,7 +435,13 @@ def home_page():
         .main {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         }
-     
+        .title-box {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
         .stTabs [data-baseweb="tab-list"] {
             background-color: rgba(255, 255, 255, 0.9);
             border-radius: 10px;
@@ -505,14 +450,34 @@ def home_page():
         </style>
     """, unsafe_allow_html=True)
     
-    # Title section
+    # Title section with centered logo above the title
     st.markdown('<div class="title-box">', unsafe_allow_html=True)
-    st.markdown("<h1 style='text-align: center; color: #667eea;'>🤖 AI-Powered Automated Candidate Evaluation System</h1>", unsafe_allow_html=True)
+    logo_path = os.path.join("assets", "logo.png")
+    if os.path.exists(logo_path):
+        # Read the file and embed as base64 so HTML centering works reliably
+        try:
+            with open(logo_path, 'rb') as _f:
+                _b64 = base64.b64encode(_f.read()).decode('utf-8')
+            img_html = (
+                f"<div style='text-align:center; margin-bottom:12px;'>"
+                f"<img src='data:image/png;base64,{_b64}' "
+                f"style='display:block; margin-left:auto; margin-right:auto; width:220px; height:auto;' alt='logo'/>"
+                f"</div>"
+            )
+            st.markdown(img_html, unsafe_allow_html=True)
+        except Exception:
+            # fallback to st.image if embed fails
+            st.image(logo_path, width=220)
+    else:
+        # Keep some spacing when logo isn't present
+        st.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
+
+    st.markdown("<h1 style='text-align: center; color: #667eea;'> Automated Candidate Evaluation System (AI Powered)</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; font-size: 18px; color: #555;'>Intelligent technical assessment with real-time AI feedback</p>", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
     
-    # Tabs for Login and Register
-    tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
+    # Tabs for Login, Register and Admin
+    tab1, tab2, tab3 = st.tabs(["🔐 Login", "📝 Register", "🛠️ Admin"])
     
     with tab1:
         st.subheader("Login to Your Account")
@@ -568,11 +533,145 @@ def home_page():
                             "email": new_email.strip(),
                             "experience": new_experience,
                             "password": hash_password(new_password),
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            # evaluation control fields
+                            "eval_chances": {},       # role -> allowed attempts (default 1)
+                            "eval_taken_counts": {}   # role -> attempts used
                         }
                         save_users(users)
                         st.success(f"Account created successfully! Welcome, {new_name}! 🎉")
                         st.info("Please login using the Login tab.")
+        with tab3:
+            st.subheader("Admin Console")
+            if not st.session_state.admin_logged_in:
+                with st.form("admin_login_form"):
+                    admin_user = st.text_input("Admin Username", key="admin_login_user")
+                    admin_pass = st.text_input("Admin Password", type="password", key="admin_login_pass")
+                    admin_submit = st.form_submit_button("Login as Admin")
+                    if admin_submit:
+                        if admin_user == ADMIN_USERNAME and admin_pass == ADMIN_PASSWORD:
+                            st.session_state.admin_logged_in = True
+                            st.session_state.admin_username = admin_user
+                            st.success("Admin logged in successfully.")
+                            st.rerun()
+                        else:
+                            st.error("Invalid admin credentials.")
+            else:
+                st.info(f"👑 Admin: {st.session_state.admin_username}")
+                users = load_users()
+                user_list = list(users.keys())
+                if not user_list:
+                    st.info("No users found.")
+                else:
+                    sel_user = st.selectbox("Select user to manage", user_list, key="admin_sel_user")
+                    if sel_user:
+                        u = users.get(sel_user, {})
+                        st.markdown(f"**User:** {u.get('name')}  •  **Username:** {sel_user}")
+                        st.markdown(f"**Email:** {u.get('email','')}  •  **Experience:** {u.get('experience','')}")
+                        st.markdown("---")
+                        # Quick search and filter
+                        st.subheader("Search & Quick Filter")
+                        search_q = st.text_input("Filter usernames (partial)", key="admin_search_q")
+                        filtered = [x for x in user_list if search_q.lower() in x.lower()] if search_q else user_list
+                        if search_q:
+                            sel_user = st.selectbox("Filtered users", filtered, key="admin_sel_user_filtered")
+                            u = users.get(sel_user, {})
+                            st.markdown(f"**User:** {u.get('name')}  •  **Username:** {sel_user}")
+                            st.markdown(f"**Email:** {u.get('email','')}  •  **Experience:** {u.get('experience','')}")
+                            st.markdown("---")
+                        # Show evaluation attempts and chances
+                        taken = u.get('eval_taken_counts', {})
+                        chances = u.get('eval_chances', {})
+                        st.subheader("Evaluation Attempts")
+                        roles = ["Java Developer", "Database Administrator", "Frontend Developer", "DevOps Engineer", "Data Engineer", "Python Developer"]
+                        for r in roles:
+                            used = taken.get(r, 0)
+                            allowed = chances.get(r, 1)
+                            st.write(f"- {r}: {used} / {allowed} attempts used")
+
+                        st.markdown("---")
+                        st.subheader("Manage Attempts")
+                        # Global defaults manager
+                        st.caption("Global settings apply to all users when set below")
+                        gcol1, gcol2 = st.columns([2,1])
+                        with gcol1:
+                            global_role = st.selectbox("Global role to set default attempts", roles, key="admin_global_role")
+                            global_default = st.number_input("Default allowed attempts for this role (applies to all users)", min_value=1, max_value=100, value=1, key="admin_global_default")
+                            if st.button("Apply Global Default to All Users"):
+                                for uname, uu in users.items():
+                                    uu.setdefault('eval_chances', {})[global_role] = int(global_default)
+                                    users[uname] = uu
+                                save_users(users)
+                                st.success(f"Applied default {global_default} attempts for role {global_role} to all users.")
+                        with gcol2:
+                            if st.button("Bulk Reset All Users' Attempts for Role"):
+                                for uname, uu in users.items():
+                                    uu.setdefault('eval_taken_counts', {})[global_role] = 0
+                                    users[uname] = uu
+                                save_users(users)
+                                st.success(f"Reset attempts for role {global_role} for ALL users.")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            m_role = st.selectbox("Role to modify", roles, key="admin_role_modify")
+                            m_allowed = st.number_input("Allowed attempts", min_value=1, max_value=100, value=chances.get(m_role, 1), key="admin_allowed")
+                            if st.button("Set Allowed Attempts"):
+                                u.setdefault('eval_chances', {})[m_role] = int(m_allowed)
+                                users[sel_user] = u
+                                save_users(users)
+                                st.success(f"Set allowed attempts for {sel_user} / {m_role} to {m_allowed}")
+                        with col2:
+                            if st.button("Reset Attempts for Role"):
+                                u.setdefault('eval_taken_counts', {})[m_role] = 0
+                                users[sel_user] = u
+                                save_users(users)
+                                st.success(f"Reset attempts for {sel_user} / {m_role}")
+
+                        if st.button("Reset All Attempts for User"):
+                            u['eval_taken_counts'] = {}
+                            users[sel_user] = u
+                            save_users(users)
+                            st.success(f"Reset all attempts for {sel_user}")
+
+                        st.markdown("---")
+                        st.subheader("Evaluation History")
+                        history = load_eval_history()
+                        user_evals = history.get(sel_user, [])
+                        if not user_evals:
+                            st.info("No evaluation history for this user.")
+                        else:
+                            for idx, ev in enumerate(reversed(user_evals), 1):
+                                with st.expander(f"Eval #{len(user_evals)-idx+1} - {ev['date']} - {ev['role']}"):
+                                    st.metric("Score", f"{ev['score']}/{ev['max_score']}")
+                                    st.markdown(f"**Percentage:** {ev['percentage']:.1f}%")
+                                    st.markdown(f"**Time:** {format_time(ev.get('time_taken',0))}")
+                                    st.markdown("---")
+                                    st.subheader("Question-wise")
+                                    for q_idx, qa in enumerate(ev.get('qa_history', []), 1):
+                                        st.markdown(f"<div class='no-copy'><strong>Q{q_idx}:</strong> {qa['q']}</div>", unsafe_allow_html=True)
+                                        st.markdown(f"**Score:** {qa['score']}/20")
+                                        st.markdown(f"**Feedback:** {qa['feedback']}")
+                                        st.markdown("---")
+
+                        # Export and download controls
+                        st.markdown("---")
+                        st.subheader("Export Data")
+                        col_e1, col_e2 = st.columns(2)
+                        with col_e1:
+                            csv_user = eval_history_to_csv_for_user(sel_user)
+                            if csv_user:
+                                st.download_button(label="📥 Export This User's Evaluations (CSV)", data=csv_user, file_name=f"evaluations_{sel_user}.csv", mime="text/csv")
+                            else:
+                                st.info("No CSV available for this user.")
+                        with col_e2:
+                            csv_all = eval_history_to_csv_all()
+                            if csv_all:
+                                st.download_button(label="📥 Export ALL Evaluations (CSV)", data=csv_all, file_name="evaluations_all_users.csv", mime="text/csv")
+                            else:
+                                st.info("No evaluation history available to export.")
+                        if st.button("Logout Admin"):
+                            st.session_state.admin_logged_in = False
+                            st.session_state.admin_username = None
+                            st.success("Admin logged out")
     
     # Features section
     st.markdown("---")
@@ -587,25 +686,18 @@ def home_page():
         st.markdown("### 📊 Instant Feedback")
         st.write("Get detailed scores and improvement suggestions immediately")
 
-def build_question_prompt(role: str, skills: List[str], language: str, is_coding: bool = False, asked_questions: List[str] = None, complexity: int = 1):
+def build_question_prompt(role: str, skills: List[str], language: str, is_coding: bool = False, asked_questions: List[str] = None):
     # Template that asks the LLM to produce role-specific technical questions
     previous_questions = ""
     if asked_questions:
-        # Escape any literal braces so PromptTemplate won't treat them as variables
-        def _escape_braces(s: str) -> str:
-            return s.replace('{', '{{').replace('}', '}}')
-
-        prev_text = _escape_braces(', '.join(asked_questions))
-        previous_questions = f"\n\nIMPORTANT: Do NOT repeat these previously asked questions: {prev_text}\nGenerate a completely DIFFERENT question."
+        previous_questions = f"\n\nIMPORTANT: Do NOT repeat these previously asked questions: {', '.join(asked_questions)}\nGenerate a completely DIFFERENT question."
     
-    complexity_note = f"Make the question complexity level: {complexity} (1=easiest, {MAX_COMPLEXITY}=hardest)."
     if is_coding:
         template = (
             "You are an interview generator for the role of {role}. "
             "The candidate's listed skills: {skills}. "
             "Generate one UNIQUE coding problem or algorithm question that requires writing actual code. "
             "The question should ask the candidate to write a function, method, or code snippet. "
-            f"{complexity_note} "
             "Make it practical and relevant to the role. "
             "Do not include answer or explanation. Output ONLY the question text. "
             f"Respond in {{language}}.{previous_questions}"
@@ -615,7 +707,6 @@ def build_question_prompt(role: str, skills: List[str], language: str, is_coding
             "You are an interview generator for the role of {role}. "
             "The candidate's listed skills: {skills}. "
             "Generate one UNIQUE theoretical or conceptual technical question (not a behavioral question) that tests these skills. "
-            f"{complexity_note} "
             "Focus on concepts, design patterns, best practices, or architecture. "
             "Do not include answer or explanation. Output ONLY the question text. "
             f"Respond in {{language}}.{previous_questions}"
@@ -663,17 +754,17 @@ def build_evaluator_prompt(role: str, skill_focus: str, question: str, candidate
     )
     return prompt
 
-def gen_question(role: str, skills: List[str], language: str, question_num: int = 1, asked_questions: List[str] = None, complexity: int = 1) -> tuple:
+def gen_question(role: str, skills: List[str], language: str, question_num: int = 1, asked_questions: List[str] = None) -> tuple:
     # Questions 3 and 5 will be coding questions
     is_coding = question_num in [3, 5]
-    prompt = build_question_prompt(role, ", ".join(skills), language, is_coding, asked_questions, complexity)
+    prompt = build_question_prompt(role, ", ".join(skills), language, is_coding, asked_questions)
     
     # Use temperature > 0 for variety in questions
     varied_llm = ChatOpenAI(
         base_url="https://genailab.tcs.in",
-        model = "azure_ai/genailab-maas-DeepSeek-V3-0324",
-        api_key="sk-DoW1qrOmGHAothEoYV2oSA",
-        http_client = client,
+        model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+        api_key=API_KEY,
+        http_client=client,
         temperature=0.7,  # Add randomness to avoid repetition
         max_tokens=400
     )
@@ -702,6 +793,48 @@ def evaluate_answer(role: str, skill_focus: str, question: str, answer: str, lan
 # -------------------------
 # UI
 # -------------------------
+def init_state():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "candidate" not in st.session_state:
+        st.session_state.candidate = {}
+    if "role" not in st.session_state:
+        st.session_state.role = None
+    if "lang" not in st.session_state:
+        st.session_state.lang = "English"
+    if "skills" not in st.session_state:
+        st.session_state.skills = []
+    if "asked_questions" not in st.session_state:
+        st.session_state.asked_questions = []
+    if "qa_history" not in st.session_state:
+        st.session_state.qa_history = []  # list of dicts: {q, a, score, feedback}
+    if "question_count" not in st.session_state:
+        st.session_state.question_count = 0
+    if "finalized" not in st.session_state:
+        st.session_state.finalized = False
+    if "current_question" not in st.session_state:
+        st.session_state.current_question = ""
+    if "welcome_shown" not in st.session_state:
+        st.session_state.welcome_shown = False
+    if "last_ai_message" not in st.session_state:
+        st.session_state.last_ai_message = ""
+    if "current_is_coding" not in st.session_state:
+        st.session_state.current_is_coding = False
+    if "question_start_time" not in st.session_state:
+        st.session_state.question_start_time = None
+    if "total_start_time" not in st.session_state:
+        st.session_state.total_start_time = None
+    if "time_expired" not in st.session_state:
+        st.session_state.time_expired = False
+    if "username" not in st.session_state:
+        st.session_state.username = None
+    if "page_redirect" not in st.session_state:
+        st.session_state.page_redirect = None
+    if "voice_mode" not in st.session_state:
+        st.session_state.voice_mode = False
+    if "audio_answer" not in st.session_state:
+        st.session_state.audio_answer = None
+
 st.set_page_config(
     page_title="AI Candidate Evaluation System", 
     page_icon="🤖",
@@ -736,17 +869,7 @@ if st.session_state.logged_in:
 else:
     menu = ["Home"]
 
-# Use a persistent selectbox value stored in session_state so the selection survives reruns.
-if 'nav_choice' not in st.session_state:
-    st.session_state.nav_choice = menu[0]
-
-# If a page_redirect was requested, apply it to the persistent nav_choice and clear it.
-if getattr(st.session_state, 'page_redirect', None) in menu:
-    st.session_state.nav_choice = st.session_state.page_redirect
-    st.session_state.page_redirect = None
-
-# Render the selectbox with a stable key so the user's selection persists across reruns.
-choice = st.sidebar.selectbox("📋 Navigation", menu, key='nav_choice')
+choice = st.sidebar.selectbox("📋 Navigation", menu)
 
 if choice == "Home":
     if not st.session_state.logged_in:
@@ -787,29 +910,75 @@ elif choice == "New Evaluation":
     st.header("Candidate Evaluation")
     st.markdown(f"**Candidate:** {st.session_state.candidate.get('name')}  •  **Experience:** {st.session_state.candidate.get('experience')}")
     with st.form("setup_form"):
-        role = st.selectbox("Choose role", ["Java Developer", "Database Administrator", "Frontend Developer", "DevOps Engineer", "Data Engineer", "Python Developer"])
+        role = st.selectbox(
+            "Choose role",
+            ["Java Developer", "Database Administrator", "Frontend Developer", "DevOps Engineer", "Data Engineer", "Python Developer"],
+        )
         language = st.selectbox("Preferred language / Multilingual", ["English", "Hindi", "Spanish", "German", "French"])
-        skills_text = st.text_input("Main technical skills (comma-separated). Example: Spring Boot, REST, SQL, Kafka")
+
+        # Show a role-specific multiselect of skills; allow optional free-text additions
+        suggested = ROLE_SKILLS.get(role, [])
+
+        # If the user changed the chosen role since the last render, reset the
+        # selected skills for the new role (start empty) and clear any
+        # previously entered free-text skills. Show a one-time info message
+        # to indicate that skills were reset.
+        if "setup_last_role" not in st.session_state or st.session_state.setup_last_role != role:
+            st.session_state.setup_selected_skills = []
+            st.session_state.setup_other_skills = ""
+            st.session_state.setup_last_role = role
+            st.session_state.setup_role_changed = True
+
+        # Use explicit keys so selections persist correctly across reruns.
+        selected_skills = st.multiselect(
+            "Select relevant skills (pick one or more)",
+            options=suggested,
+            key="setup_selected_skills",
+            help="Pick the skills to focus the evaluation on",
+        )
+        # If we just changed role, inform the user once that skills were reset
+        if st.session_state.get("setup_role_changed"):
+            st.info("Skills reset to match the newly selected role.")
+            st.session_state.setup_role_changed = False
+        other_skills = st.text_input(
+            "Other skills (comma-separated)",
+            key="setup_other_skills",
+            help="Optional: add skills not listed above, comma-separated",
+        )
+
         start = st.form_submit_button("Start Evaluation")
         if start:
             st.session_state.role = role
             st.session_state.lang = language
-            skills = [s.strip() for s in skills_text.split(",") if s.strip()]
+            # Merge selected and other skills into a single list
+            skills = []
+            if selected_skills:
+                skills.extend([s for s in selected_skills if s and s.strip()])
+            if other_skills:
+                skills.extend([s.strip() for s in other_skills.split(",") if s.strip()])
             if not skills:
-                st.warning("Please list at least one skill to focus the interview.")
+                st.warning("Please select or enter at least one skill to focus the interview.")
             else:
-                st.session_state.skills = skills
-                st.session_state.asked_questions = []
-                st.session_state.qa_history = []
-                st.session_state.question_count = 0
-                st.session_state.finalized = False
-                st.session_state.welcome_shown = False  # Reset welcome for new evaluation
-                st.session_state.current_question = ""
-                st.session_state.question_start_time = None
-                st.session_state.total_start_time = time.time()  # Start total timer
-                st.session_state.time_expired = False
-                st.success("Setup complete. Scroll down to the chat below.")
-                st.rerun()
+                    # Check user's remaining chances for this role
+                    users = load_users()
+                    user = users.get(st.session_state.username, {}) if st.session_state.username else {}
+                    taken = user.get("eval_taken_counts", {}).get(role, 0)
+                    allowed = user.get("eval_chances", {}).get(role, 1)
+                    if taken >= allowed and not st.session_state.admin_logged_in:
+                        st.error(f"You have used all allowed evaluation attempts for the role '{role}'. Contact an admin to reset attempts.")
+                    else:
+                        st.session_state.skills = skills
+                        st.session_state.asked_questions = []
+                        st.session_state.qa_history = []
+                        st.session_state.question_count = 0
+                        st.session_state.finalized = False
+                        st.session_state.welcome_shown = False  # Reset welcome for new evaluation
+                        st.session_state.current_question = ""
+                        st.session_state.question_start_time = None
+                        st.session_state.total_start_time = time.time()  # Start total timer
+                        st.session_state.time_expired = False
+                        st.success("Setup complete. Scroll down to the chat below.")
+                        st.rerun()
 
     # Chat / interview UI
     if st.session_state.role and st.session_state.skills:
@@ -831,7 +1000,7 @@ elif choice == "New Evaluation":
             st.session_state.last_ai_message = welcome_text
             
             # Generate first question
-            first_q, is_coding = gen_question(st.session_state.role, st.session_state.skills, st.session_state.lang, question_num=1, asked_questions=[], complexity=st.session_state.complexity_level)
+            first_q, is_coding = gen_question(st.session_state.role, st.session_state.skills, st.session_state.lang, question_num=1, asked_questions=[])
             st.session_state.asked_questions.append(first_q)
             st.session_state.question_count = 1
             st.session_state.current_question = first_q
@@ -851,13 +1020,8 @@ elif choice == "New Evaluation":
         col1, col2 = st.columns([3, 1])
         with col2:
             if not st.session_state.finalized:
-                try:
-                    # Client-side total timer that updates without Streamlit reruns
-                    timer_html = create_total_timer_html(st.session_state.total_start_time or time.time(), 50 * 60, "total")
-                    st.components.v1.html(timer_html, height=80, scrolling=False)
-                except Exception:
-                    timer_placeholder = st.empty()
-                    timer_placeholder.metric("⏱️ Total Time Left", format_time(total_time_remaining))
+                timer_placeholder = st.empty()
+                timer_placeholder.metric("⏱️ Total Time Left", format_time(total_time_remaining))
         
         # Display welcome message
         if st.session_state.last_ai_message and not st.session_state.qa_history:
@@ -870,7 +1034,7 @@ elif choice == "New Evaluation":
                 # Determine if this was a coding question (questions 3 and 5)
                 q_type_icon = "💻" if idx in [3, 5] else "💭"
                 with st.expander(f"{q_type_icon} Question {idx} - Score: {qa.get('score')}/20", expanded=False):
-                    st.markdown(f"**Q:** {qa['q']}")
+                    st.markdown(f"<div class='no-copy'><strong>Q:</strong> {qa['q']}</div>", unsafe_allow_html=True)
                     st.markdown(f"**Your Answer:** {qa['a']}")
                     st.markdown(f"**Feedback:** {qa.get('feedback')}")
             st.markdown("---")
@@ -884,148 +1048,57 @@ elif choice == "New Evaluation":
                 st.session_state.voice_mode = voice_enabled
                 st.rerun()
         with col_v3:
-            # Diagnostic Test TTS button
+            # Test TTS button
             if st.session_state.voice_mode:
                 test_button_html = """
-                <div style="display:flex; flex-direction:column; gap:8px;">
-                                    <div>
-                                        <button id="tts_test_btn" style="
-                        background-color: #27ae60;
-                        color: white;
-                        border: none;
-                        padding: 10px 20px;
-                        border-radius: 8px;
-                        cursor: pointer;
-                        font-size: 14px;
-                        font-weight: 600;
-                        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-                    ">🔊 Test TTS</button>
-                    <button id="tts_clear_btn" style="
-                        background-color: #95a5a6;
-                        color: white;
-                        border: none;
-                        padding: 8px 12px;
-                        border-radius: 8px;
-                        cursor: pointer;
-                        font-size: 12px;
-                        margin-left:8px;
-                    ">🧹 Clear Log</button>
-                  </div>
-                  <div id="tts_diag_area" style="background:#fafafa;border:1px solid #e6e6e6;padding:6px;border-radius:6px;max-height:120px;overflow:auto;font-size:13px;">
-                    <div id="voices_list">Voices: (not checked)</div>
-                    <div id="tts_log" style="margin-top:8px;color:#222"></div>
-                  </div>
-                </div>
+                <button onclick="testTTS()" style="
+                    background-color: #27ae60;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    font-size: 14px;
+                    font-weight: 600;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+                ">
+                    🔊 Test TTS
+                </button>
                 <script type="text/javascript">
-                function logTTS(msg) {
-                    try {
-                        var l = document.getElementById('tts_log');
-                        var el = document.createElement('div');
-                        el.textContent = (new Date()).toLocaleTimeString() + ' — ' + msg;
-                        l.appendChild(el);
-                        // keep scrolled to bottom
-                        l.parentElement.scrollTop = l.parentElement.scrollHeight;
-                    } catch(e) { console.log('logTTS error', e); }
-                }
-
-                function clearTTSLog() {
-                    try { document.getElementById('tts_log').innerHTML = ''; document.getElementById('voices_list').innerHTML = 'Voices: (not checked)'; } catch(e){}
-                }
-
-                function renderVoices(vs) {
-                    try {
-                        var html = '<strong>Voices (' + (vs.length || 0) + '):</strong><ul style="margin:4px 0;padding-left:18px;">';
-                        vs.forEach(function(v){ html += '<li>' + (v.name || 'unknown') + ' (' + (v.lang||'') + ')' + (v.default? ' [default]':'') + '</li>'; });
-                        html += '</ul>';
-                        document.getElementById('voices_list').innerHTML = html;
-                    } catch(e){ console.warn('renderVoices error', e); }
-                }
-
                 function testTTS() {
-                    logTTS('Starting diagnostic...');
-
-                    if (!('speechSynthesis' in window)) {
-                        logTTS('Speech Synthesis API not supported in this browser.');
+                    if ('speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                        setTimeout(function() {
+                            var testMsg = new SpeechSynthesisUtterance();
+                            testMsg.text = 'Text to speech is working correctly! Hello from the AI evaluation system.';
+                            testMsg.lang = 'en-US';
+                            testMsg.rate = 0.9;
+                            testMsg.pitch = 1;
+                            testMsg.volume = 1;
+                            
+                            testMsg.onstart = function() {
+                                console.log('TTS test started');
+                            };
+                            
+                            testMsg.onend = function() {
+                                console.log('TTS test completed');
+                            };
+                            
+                            testMsg.onerror = function(event) {
+                                console.error('TTS test error:', event);
+                                alert('TTS Error: ' + event.error);
+                            };
+                            
+                            window.speechSynthesis.speak(testMsg);
+                        }, 100);
+                    } else {
                         alert('Speech synthesis is not supported in your browser');
-                        return;
                     }
-
-                    // Cancel any ongoing speech
-                    try { window.speechSynthesis.cancel(); } catch(e) { console.warn(e); }
-
-                    var speakNow = function(vs) {
-                        try {
-                            var msg = new SpeechSynthesisUtterance('This is a diagnostic test. If you hear this, text to speech is working.');
-                            msg.lang = 'en-US';
-                            msg.rate = 0.9;
-                            msg.pitch = 1;
-                            msg.volume = 1;
-
-                            msg.onstart = function() { logTTS('TTS playback started'); };
-                            msg.onend = function() { logTTS('TTS playback ended'); };
-                            msg.onerror = function(ev) { logTTS('TTS playback error: ' + (ev && ev.error ? ev.error : JSON.stringify(ev))); alert('TTS Error: ' + (ev && ev.error ? ev.error : 'unknown')); };
-
-                            // Choose a preferred English voice if available
-                            var preferred = null;
-                            try {
-                                preferred = (vs || []).find(function(v){ return v && v.lang && v.lang.toLowerCase().startsWith('en'); }) || (vs && vs[0]);
-                            } catch(e) { console.warn('voice pick error', e); }
-                            if (preferred) {
-                                try { msg.voice = preferred; logTTS('Using voice: ' + (preferred.name || preferred.lang)); } catch(e) { logTTS('Could not set voice: ' + e); }
-                            } else {
-                                logTTS('No voice chosen (empty list)');
-                            }
-
-                            // Speak after a short delay to ensure cancel took effect
-                            setTimeout(function(){ try { window.speechSynthesis.speak(msg); } catch(e) { logTTS('Speak call failed: ' + e); } }, 120);
-                        } catch(e) { logTTS('speakNow exception: ' + e); }
-                    };
-
-                    // If voices already available
-                    var currentVoices = (window.speechSynthesis.getVoices && window.speechSynthesis.getVoices()) || [];
-                    if (currentVoices.length > 0) {
-                        renderVoices(currentVoices);
-                        logTTS('Voices available: ' + currentVoices.length);
-                        speakNow(currentVoices);
-                        return;
-                    }
-
-                    // Wait for voiceschanged event (Edge/Chromium may load them asynchronously)
-                    var appeared = false;
-                    var onVoices = function() {
-                        try {
-                            var vs = window.speechSynthesis.getVoices() || [];
-                            renderVoices(vs);
-                            logTTS('voiceschanged event fired, voices: ' + vs.length);
-                            if (!appeared) { appeared = true; speakNow(vs); }
-                        } catch(e) { console.warn(e); }
-                    };
-                    try {
-                        if (window.speechSynthesis.addEventListener) {
-                            window.speechSynthesis.addEventListener('voiceschanged', onVoices);
-                        } else {
-                            window.speechSynthesis.onvoiceschanged = onVoices;
-                        }
-                        // Also attempt to trigger getVoices to populate list
-                        setTimeout(function(){ try { renderVoices(window.speechSynthesis.getVoices() || []); logTTS('Requested voices list; waiting for voiceschanged...'); } catch(e){} }, 50);
-                    } catch(e) { logTTS('Failed to attach voiceschanged listener: ' + e); }
                 }
-                // Attach event listeners to buttons to avoid inline onclicks
-                try {
-                    var _btn_test = document.getElementById('tts_test_btn');
-                    if (_btn_test && !_btn_test._copilot_bound) { _btn_test.addEventListener('click', function(e){ e.preventDefault(); try{ testTTS(); }catch(err){ console.error(err); } }); _btn_test._copilot_bound = true; }
-                    var _btn_clear = document.getElementById('tts_clear_btn');
-                    if (_btn_clear && !_btn_clear._copilot_bound) { _btn_clear.addEventListener('click', function(e){ e.preventDefault(); try{ clearTTSLog(); }catch(err){ console.error(err); } }); _btn_clear._copilot_bound = true; }
-                } catch(e) { console.warn('attach listeners failed', e); }
                 </script>
                 """
-                # Use components.html so embedded <script> tags run (st.markdown sanitizes scripts)
-                try:
-                    st.components.v1.html(test_button_html, height=120, scrolling=True)
-                except Exception:
-                    # Fallback to markdown if components not available
-                    st.markdown(test_button_html, unsafe_allow_html=True)
-                st.caption("Click to run a diagnostic TTS test (shows voices and logs). If you see no voices, open DevTools Console for more details.")
+                st.markdown(test_button_html, unsafe_allow_html=True)
+                st.caption("Click to test if audio works")
         
         # Display current question (newest at bottom)
         if st.session_state.current_question and st.session_state.question_count > 0 and st.session_state.question_count <= 5:
@@ -1034,34 +1107,77 @@ elif choice == "New Evaluation":
             
             question_type = "💻 Coding Question" if st.session_state.current_is_coding else "💭 Conceptual Question"
             st.markdown(f"### ❓ Question {st.session_state.question_count}: {question_type}")
-            
             # Display question timer
             col1, col2, col3 = st.columns([3, 1, 0.5])
             with col1:
-                st.markdown(f"**{st.session_state.current_question}**")
-                
+                # Render question inside a protected container to prevent copying
+                st.markdown(
+                    f"<div id='current_question' class='no-copy' style='font-size:16px;'><strong>{st.session_state.current_question}</strong></div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Inject JS/CSS to block copy/right-click for elements with class 'no-copy'
+                if st.session_state.question_count and not st.session_state.finalized:
+                    st.markdown(
+                        """
+                        <style>
+                        .no-copy { user-select: none; -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; }
+                        </style>
+                        <script>
+                        (function(){
+                          function blockEvent(e,msg){ e.preventDefault(); alert(msg); return false; }
+                          var msgCopy = 'Copying questions is disabled during the evaluation to ensure integrity.';
+                          var msgRight = 'Right-click is disabled during evaluation.';
+
+                          document.addEventListener('copy', function(e){
+                            var sel = window.getSelection();
+                            if (!sel||sel.toString().trim()==='') return;
+                            var node = sel.anchorNode;
+                            while(node){
+                              if (node.nodeType===1 && node.classList && node.classList.contains('no-copy')){ blockEvent(e,msgCopy); return; }
+                              node = node.parentNode;
+                            }
+                          }, true);
+
+                          document.addEventListener('cut', function(e){
+                            var sel = window.getSelection();
+                            var node = sel.anchorNode;
+                            while(node){
+                              if (node.nodeType===1 && node.classList && node.classList.contains('no-copy')){ blockEvent(e,msgCopy); return; }
+                              node = node.parentNode;
+                            }
+                          }, true);
+
+                          document.addEventListener('contextmenu', function(e){
+                            var el = e.target;
+                            while(el){ if (el.classList && el.classList.contains('no-copy')){ blockEvent(e,msgRight); return; } el = el.parentNode; }
+                          }, true);
+
+                          document.addEventListener('keydown', function(e){
+                            if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='c'){
+                              var sel = window.getSelection(); var node = sel.anchorNode;
+                              while(node){ if (node.nodeType===1 && node.classList && node.classList.contains('no-copy')){ blockEvent(e,msgCopy); return; } node = node.parentNode; }
+                            }
+                          }, true);
+                        })();
+                        </script>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
                 # Add text-to-speech button for the question
                 if st.session_state.voice_mode:
                     # Use both approaches for better compatibility
                     col_tts1, col_tts2 = st.columns([1, 3])
                     with col_tts1:
-                        # HTML-based TTS button — use components to allow scripts to run
-                        try:
-                            st.components.v1.html(create_audio_player(st.session_state.current_question, f"q{st.session_state.question_count}"), height=80, scrolling=False)
-                        except Exception:
-                            st.markdown(create_audio_player(st.session_state.current_question, f"q{st.session_state.question_count}"), unsafe_allow_html=True)
+                        # HTML-based TTS button
+                        st.markdown(create_audio_player(st.session_state.current_question, f"q{st.session_state.question_count}"), unsafe_allow_html=True)
                     with col_tts2:
                         st.caption("💡 Click the button above to hear the question read aloud")
-            
+
             with col2:
-                # Use client-side timer so it updates automatically without Streamlit rerun
-                try:
-                    timer_html = create_timer_html(st.session_state.question_start_time or time.time(), 3 * 60, f"q{st.session_state.question_count}")
-                    st.components.v1.html(timer_html, height=60, scrolling=False)
-                except Exception:
-                    # fallback to static metric
-                    timer_color = "🟢" if question_time_remaining > 300 else "🟡" if question_time_remaining > 60 else "🔴"
-                    st.metric(f"{timer_color} Question Timer", format_time(question_time_remaining))
+                timer_color = "🟢" if question_time_remaining > 300 else "🟡" if question_time_remaining > 60 else "🔴"
+                st.metric(f"{timer_color} Question Timer", format_time(question_time_remaining))
             with col3:
                 if st.button("🔄", help="Refresh timer"):
                     st.rerun()
@@ -1071,25 +1187,114 @@ elif choice == "New Evaluation":
             # Check if question time expired
             question_time_remaining = get_time_remaining(st.session_state.question_start_time, 10 * 60)
             
-      
+            # Voice input section (outside form)
+            if st.session_state.voice_mode:
+                st.markdown("#### 🎤 Voice Input")
                 
+                if AUDIO_AVAILABLE:
+                    st.info("💡 Click the microphone button below to record your answer, or type it manually.")
+                    
+                    col_mic1, col_mic2 = st.columns([2, 1])
+                    with col_mic1:
+                        audio_bytes = audio_recorder(
+                            text="Click to record",
+                            recording_color="#e74c3c",
+                            neutral_color="#667eea",
+                            icon_name="microphone",
+                            icon_size="3x",
+                            key=f"audio_recorder_{st.session_state.question_count}"
+                        )
+                        
+                        if audio_bytes:
+                            st.success("✅ Audio recorded! Converting to text...")
+                            st.info("Note: For production, integrate with Google Speech-to-Text or Whisper API for accurate transcription.")
+                            st.session_state.audio_answer = "[Voice answer recorded - transcription would appear here with Speech-to-Text API]"
+                    with col_mic2:
+                        if st.button("🗑️ Clear Recording"):
+                            st.session_state.audio_answer = None
+                            st.rerun()
+                else:
+                    st.warning("⚠️ Voice recording library not installed. Using browser-based alternative...")
+                    
+                    # Fallback: HTML5 audio recording
+                    st.markdown("""
+                    <div style="padding: 20px; background: #f0f2f6; border-radius: 10px; margin: 10px 0;">
+                        <button onclick="startRecording()" id="recordBtn" style="
+                            background-color: #667eea;
+                            color: white;
+                            border: none;
+                            padding: 12px 24px;
+                            border-radius: 5px;
+                            cursor: pointer;
+                            font-size: 16px;
+                            margin: 5px;
+                        ">
+                            🎙️ Start Recording
+                        </button>
+                        <button onclick="stopRecording()" id="stopBtn" style="
+                            background-color: #e74c3c;
+                            color: white;
+                            border: none;
+                            padding: 12px 24px;
+                            border-radius: 5px;
+                            cursor: pointer;
+                            font-size: 16px;
+                            margin: 5px;
+                            display: none;
+                        ">
+                            ⏹️ Stop Recording
+                        </button>
+                        <div id="status" style="margin-top: 10px; font-weight: bold;"></div>
+                    </div>
+                    <script>
+                    let mediaRecorder;
+                    let audioChunks = [];
+                    
+                    async function startRecording() {
+                        try {
+                            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                            mediaRecorder = new MediaRecorder(stream);
+                            audioChunks = [];
+                            
+                            mediaRecorder.ondataavailable = (event) => {
+                                audioChunks.push(event.data);
+                            };
+                            
+                            mediaRecorder.onstop = () => {
+                                document.getElementById('status').innerHTML = '✅ Recording saved! You can now type your answer below or re-record.';
+                            };
+                            
+                            mediaRecorder.start();
+                            document.getElementById('recordBtn').style.display = 'none';
+                            document.getElementById('stopBtn').style.display = 'inline-block';
+                            document.getElementById('status').innerHTML = '🔴 Recording in progress...';
+                        } catch (err) {
+                            document.getElementById('status').innerHTML = '❌ Microphone access denied. Please allow microphone access.';
+                        }
+                    }
+                    
+                    function stopRecording() {
+                        mediaRecorder.stop();
+                        mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                        document.getElementById('recordBtn').style.display = 'inline-block';
+                        document.getElementById('stopBtn').style.display = 'none';
+                    }
+                    </script>
+                    """, unsafe_allow_html=True)
+                    
+                    st.info("ℹ️ After recording, type your answer in the text box below. For production, install: `pip install audio-recorder-streamlit`")
+                    
+                    if st.button("🗑️ Clear Recording"):
+                        st.session_state.audio_answer = None
+                        st.rerun()
+                
+                st.markdown("---")
             
             with st.form("answer_form", clear_on_submit=True):
                 # Pre-fill with audio transcription if available
                 default_text = st.session_state.audio_answer if st.session_state.audio_answer else ""
                 placeholder_text = "Write your code here..." if st.session_state.current_is_coding else "Type your answer here (or use voice input above)..."
-                # If coding question, provide an embedded code IDE to write code
-                if st.session_state.current_is_coding:
-                    # Allow candidate to choose language for the coding IDE
-                    lang_choice = st.selectbox("Code language", ["python", "javascript", "java", "c", "cpp", "go", "ruby"], index=0, key=f"lang_q{st.session_state.question_count}")
-                    try:
-                        st.components.v1.html(create_code_ide_html(default_text, f"ide_q{st.session_state.question_count}", language=lang_choice), height=420, scrolling=True)
-                    except Exception:
-                        # fallback to textarea if components not available
-                        pass
-                    answer = st.text_area("Your answer", value=default_text, key="answer_area", height=220, placeholder=placeholder_text)
-                else:
-                    answer = st.text_area("Your answer", value=default_text, key="answer_area", height=150, placeholder=placeholder_text)
+                answer = st.text_area("Your answer", value=default_text, key="answer_area", height=200 if st.session_state.current_is_coding else 150, placeholder=placeholder_text)
                 
                 col1, col2 = st.columns([1, 1])
                 with col1:
@@ -1123,17 +1328,6 @@ elif choice == "New Evaluation":
                     score = int(eval_result.get("score", 0))
                     reason = eval_result.get("reason", "") or eval_result.get("raw", "")
                     suggestions = eval_result.get("suggestions", "")
-
-                    # Adjust complexity based on result: increase complexity on good answers
-                    try:
-                        if score >= CORRECT_SCORE_THRESHOLD:
-                            st.session_state.complexity_level = min(MAX_COMPLEXITY, st.session_state.complexity_level + 1)
-                        else:
-                            # keep same complexity on incorrect or low score
-                            st.session_state.complexity_level = max(MIN_COMPLEXITY, st.session_state.complexity_level)
-                    except Exception:
-                        # ensure complexity stays within bounds
-                        st.session_state.complexity_level = max(MIN_COMPLEXITY, min(MAX_COMPLEXITY, st.session_state.get('complexity_level', 1)))
                     
                     # Save to history
                     st.session_state.qa_history.append({
@@ -1177,6 +1371,18 @@ elif choice == "New Evaluation":
                             "time_taken": time_taken,
                             "qa_history": st.session_state.qa_history
                         })
+                        # Increment user's taken count for this role
+                        try:
+                            users = load_users()
+                            if st.session_state.username in users:
+                                u = users[st.session_state.username]
+                                taken = u.get("eval_taken_counts", {})
+                                taken[st.session_state.role] = taken.get(st.session_state.role, 0) + 1
+                                u["eval_taken_counts"] = taken
+                                users[st.session_state.username] = u
+                                save_users(users)
+                        except Exception:
+                            pass
                         
                         st.balloons()
                         st.success("🎉 Interview complete! You've answered all 5 questions.")
@@ -1195,8 +1401,7 @@ elif choice == "New Evaluation":
                                     st.session_state.skills, 
                                     st.session_state.lang, 
                                     question_num=next_q_num,
-                                    asked_questions=st.session_state.asked_questions,
-                                    complexity=st.session_state.complexity_level
+                                    asked_questions=st.session_state.asked_questions
                                 )
                                 # Check if question is truly unique (not just different wording)
                                 is_duplicate = False
@@ -1312,7 +1517,7 @@ elif choice == "Results":
         q_type_icon = "💻" if i in [3, 5] else "💭"
         score_color = "🟢" if qa['score'] >= 16 else "🟡" if qa['score'] >= 12 else "🟠" if qa['score'] >= 8 else "🔴"
         with st.expander(f"{q_type_icon} Question {i} - {score_color} Score: {qa['score']}/20", expanded=False):
-            st.markdown(f"**Q:** {qa['q']}")
+            st.markdown(f"<div class='no-copy'><strong>Q:</strong> {qa['q']}</div>", unsafe_allow_html=True)
             st.markdown(f"**Your Answer:** {qa['a']}")
             st.markdown(f"**Feedback:** {qa['feedback']}")
 
@@ -1375,7 +1580,6 @@ elif choice == "Results":
     # Export results button
     if len(st.session_state.qa_history) == 5:
         if st.button("📥 Export Complete Evaluation Report", use_container_width=True):
-            import io
             out = io.StringIO()
             out.write("="*60 + "\n")
             out.write("CANDIDATE EVALUATION REPORT\n")
